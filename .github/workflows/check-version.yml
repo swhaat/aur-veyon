@@ -1,0 +1,137 @@
+name: Check for New Version
+
+on:
+  schedule:
+    # Run every 3 days at 00:00 UTC
+    - cron: '0 0 */3 * *'
+  workflow_dispatch:
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest Veyon release
+        id: get_latest
+        run: |
+          # Fetch latest release from GitHub API
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/veyon/veyon/releases/latest)
+          LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name')
+          LATEST_VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
+          
+          echo "Latest version: $LATEST_VERSION"
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Get current PKGBUILD version
+        id: get_current
+        run: |
+          CURRENT_VERSION=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+          echo "Current version: $CURRENT_VERSION"
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Compare versions
+        id: compare
+        run: |
+          CURRENT="${{ steps.get_current.outputs.current_version }}"
+          LATEST="${{ steps.get_latest.outputs.latest_version }}"
+          
+          echo "Current: $CURRENT"
+          echo "Latest: $LATEST"
+          
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "⚠️  New version available: $LATEST (current: $CURRENT)"
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+            echo "✓ Already up to date"
+          fi
+
+      - name: Get commit hash for new version
+        if: steps.compare.outputs.needs_update == 'true'
+        id: get_commit
+        run: |
+          # Get the commit hash for the new tag
+          COMMIT_HASH=$(curl -s "https://api.github.com/repos/veyon/veyon/git/ref/tags/${{ steps.get_latest.outputs.latest_tag }}" | jq -r '.object.sha')
+          
+          # If it's an annotated tag, get the actual commit it points to
+          if [ $(curl -s "https://api.github.com/repos/veyon/veyon/git/tags/$COMMIT_HASH" | jq -r '.object.type') == "commit" ]; then
+            COMMIT_HASH=$(curl -s "https://api.github.com/repos/veyon/veyon/git/tags/$COMMIT_HASH" | jq -r '.object.sha')
+          fi
+          
+          echo "Commit hash: $COMMIT_HASH"
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+
+      - name: Create update branch and PR
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_VERSION="${{ steps.get_latest.outputs.latest_version }}"
+          COMMIT_HASH="${{ steps.get_commit.outputs.commit_hash }}"
+          BRANCH_NAME="update-veyon-$LATEST_VERSION"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create new branch
+          git checkout -b "$BRANCH_NAME"
+          
+          # Update PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=$LATEST_VERSION/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^_commit=.*/_commit=$COMMIT_HASH  # tags\/v$LATEST_VERSION/" PKGBUILD
+          
+          # Commit changes
+          git add PKGBUILD
+          git commit -m "Update veyon to version $LATEST_VERSION"
+          
+          # Push branch
+          git push -u origin "$BRANCH_NAME"
+          
+          # Create pull request
+          gh pr create \
+            --title "Update veyon to version $LATEST_VERSION" \
+            --body "Automated update to veyon version $LATEST_VERSION
+
+## Changes
+- Version: ${{ steps.get_current.outputs.current_version }} → $LATEST_VERSION
+- Commit: $COMMIT_HASH
+- Release notes: https://github.com/veyon/veyon/releases/tag/${{ steps.get_latest.outputs.latest_tag }}
+
+## Checklist
+- [ ] Review PKGBUILD changes
+- [ ] Build and test the package
+- [ ] Verify veyon service status works
+- [ ] Merge and deploy to AUR
+
+This PR was automatically created by the version check workflow." \
+            --base main \
+            --head "$BRANCH_NAME"
+
+      - name: Create issue if PR creation fails
+        if: steps.compare.outputs.needs_update == 'true' && failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_VERSION="${{ steps.get_latest.outputs.latest_version }}"
+          
+          gh issue create \
+            --title "New veyon version available: $LATEST_VERSION" \
+            --body "A new version of veyon is available but automated PR creation failed.
+
+**Current version:** ${{ steps.get_current.outputs.current_version }}
+**New version:** $LATEST_VERSION
+**Release notes:** https://github.com/veyon/veyon/releases/tag/${{ steps.get_latest.outputs.latest_tag }}
+
+Please update the PKGBUILD manually:
+\`\`\`
+pkgver=$LATEST_VERSION
+pkgrel=1
+_commit=${{ steps.get_commit.outputs.commit_hash }}  # tags/v$LATEST_VERSION
+\`\`\`" \
+            --label "update"

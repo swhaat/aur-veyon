@@ -1,0 +1,132 @@
+name: Build, Test and Deploy to AUR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'PKGBUILD'
+      - '.SRCINFO'
+  workflow_dispatch:
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize Arch Linux keyring and update system
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm
+
+      - name: Install build dependencies
+        run: |
+          pacman -S --noconfirm devtools git openssh namcap
+
+      - name: Create build user
+        run: |
+          useradd -m -G wheel builder
+          echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          chown -R builder:builder .
+
+      - name: Setup chroot environment
+        run: |
+          mkdir -p /var/lib/archbuild/extra-x86_64
+          sudo -u builder mkarchroot /var/lib/archbuild/extra-x86_64/root base-devel
+
+      - name: Build package in clean chroot
+        run: |
+          sudo -u builder makechrootpkg -c -r /var/lib/archbuild/extra-x86_64
+
+      - name: List built packages
+        run: |
+          ls -lah *.pkg.tar.zst || echo "No packages found"
+
+      - name: Check package with namcap
+        run: |
+          namcap PKGBUILD
+          namcap *.pkg.tar.zst || true
+
+      - name: Create test chroot
+        run: |
+          mkdir -p /var/lib/archbuild/test-x86_64
+          mkarchroot /var/lib/archbuild/test-x86_64/root base
+
+      - name: Install package in test chroot
+        run: |
+          # Copy the built package to test chroot
+          cp veyon-*.pkg.tar.zst /var/lib/archbuild/test-x86_64/root/
+          
+          # Install package in chroot
+          arch-chroot /var/lib/archbuild/test-x86_64/root /bin/bash -c "
+            pacman -U --noconfirm /veyon-*.pkg.tar.zst
+          "
+
+      - name: Test veyon service status command
+        run: |
+          # Run the test command in chroot
+          arch-chroot /var/lib/archbuild/test-x86_64/root /bin/bash -c "
+            veyon service status
+          " && echo "✓ Test passed: veyon service status executed successfully" || exit 1
+
+      - name: Generate .SRCINFO
+        run: |
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
+      - name: Setup SSH for AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p /root/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/aur
+          chmod 600 /root/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> /root/.ssh/known_hosts
+          
+          cat > /root/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile /root/.ssh/aur
+            User aur
+          EOF
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Clone AUR repository
+        run: |
+          cd /tmp
+          git clone ssh://aur@aur.archlinux.org/veyon.git aur-veyon
+
+      - name: Update AUR repository
+        run: |
+          cp PKGBUILD /tmp/aur-veyon/
+          cp .SRCINFO /tmp/aur-veyon/
+          
+          cd /tmp/aur-veyon
+          git add PKGBUILD .SRCINFO
+          
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update to version $(grep pkgver= PKGBUILD | cut -d= -f2)"
+            git push
+            echo "✓ Successfully pushed to AUR"
+          fi
+
+      - name: Upload built packages as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veyon-packages
+          path: |
+            *.pkg.tar.zst
+            .SRCINFO
+          retention-days: 30
