@@ -94,22 +94,35 @@ jobs:
           git push -u origin "$BRANCH_NAME"
           
           # Create pull request
+          CURRENT_VERSION="${{ steps.get_current.outputs.current_version }}"
+          LATEST_TAG="${{ steps.get_latest.outputs.latest_tag }}"
+          
+          cat > /tmp/pr_body.txt << 'EOF'
+          Automated update to veyon version $LATEST_VERSION
+          
+          ## Changes
+          - Version: $CURRENT_VERSION → $LATEST_VERSION
+          - Commit: $COMMIT_HASH
+          - Release notes: https://github.com/veyon/veyon/releases/tag/$LATEST_TAG
+          
+          ## Checklist
+          - [ ] Review PKGBUILD changes
+          - [ ] Build and test the package
+          - [ ] Verify veyon service status works
+          - [ ] Merge and deploy to AUR
+          
+          This PR was automatically created by the version check workflow.
+          EOF
+          
+          # Substitute variables in the template
+          sed -i "s|\$LATEST_VERSION|$LATEST_VERSION|g" /tmp/pr_body.txt
+          sed -i "s|\$CURRENT_VERSION|$CURRENT_VERSION|g" /tmp/pr_body.txt
+          sed -i "s|\$COMMIT_HASH|$COMMIT_HASH|g" /tmp/pr_body.txt
+          sed -i "s|\$LATEST_TAG|$LATEST_TAG|g" /tmp/pr_body.txt
+          
           gh pr create \
             --title "Update veyon to version $LATEST_VERSION" \
-            --body "Automated update to veyon version $LATEST_VERSION
-
-## Changes
-- Version: ${{ steps.get_current.outputs.current_version }} → $LATEST_VERSION
-- Commit: $COMMIT_HASH
-- Release notes: https://github.com/veyon/veyon/releases/tag/${{ steps.get_latest.outputs.latest_tag }}
-
-## Checklist
-- [ ] Review PKGBUILD changes
-- [ ] Build and test the package
-- [ ] Verify veyon service status works
-- [ ] Merge and deploy to AUR
-
-This PR was automatically created by the version check workflow." \
+            --body-file /tmp/pr_body.txt \
             --base main \
             --head "$BRANCH_NAME"
 
@@ -119,19 +132,22 @@ This PR was automatically created by the version check workflow." \
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LATEST_VERSION="${{ steps.get_latest.outputs.latest_version }}"
+          CURRENT_VERSION="${{ steps.get_current.outputs.current_version }}"
+          LATEST_TAG="${{ steps.get_latest.outputs.latest_tag }}"
+          COMMIT_HASH="${{ steps.get_commit.outputs.commit_hash }}"
           
           gh issue create \
             --title "New veyon version available: $LATEST_VERSION" \
             --body "A new version of veyon is available but automated PR creation failed.
 
-**Current version:** ${{ steps.get_current.outputs.current_version }}
+**Current version:** $CURRENT_VERSION
 **New version:** $LATEST_VERSION
-**Release notes:** https://github.com/veyon/veyon/releases/tag/${{ steps.get_latest.outputs.latest_tag }}
+**Release notes:** https://github.com/veyon/veyon/releases/tag/$LATEST_TAG
 
 Please update the PKGBUILD manually:
 \`\`\`
 pkgver=$LATEST_VERSION
 pkgrel=1
-_commit=${{ steps.get_commit.outputs.commit_hash }}  # tags/v$LATEST_VERSION
+_commit=$COMMIT_HASH  # tags/v$LATEST_VERSION
 \`\`\`" \
             --label "update"
