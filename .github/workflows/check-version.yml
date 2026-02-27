@@ -1,4 +1,4 @@
-name: Check for New Version
+name: Check for Updates and Build
 
 on:
   schedule:
@@ -9,7 +9,13 @@ on:
 jobs:
   check-version:
     runs-on: ubuntu-latest
-    
+    outputs:
+      needs_update: ${{ steps.compare.outputs.needs_update }}
+      latest_version: ${{ steps.get_latest.outputs.latest_version }}
+      latest_tag: ${{ steps.get_latest.outputs.latest_tag }}
+      current_version: ${{ steps.get_current.outputs.current_version }}
+      commit_hash: ${{ steps.get_commit.outputs.commit_hash }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,11 +23,11 @@ jobs:
       - name: Get latest Veyon release
         id: get_latest
         run: |
-          # Fetch latest release from GitHub API
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/veyon/veyon/releases/latest)
+          LATEST_RELEASE=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/veyon/veyon/releases/latest)
           LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name')
           LATEST_VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
-          
           echo "Latest version: $LATEST_VERSION"
           echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
@@ -38,116 +44,154 @@ jobs:
         run: |
           CURRENT="${{ steps.get_current.outputs.current_version }}"
           LATEST="${{ steps.get_latest.outputs.latest_version }}"
-          
-          echo "Current: $CURRENT"
-          echo "Latest: $LATEST"
-          
           if [ "$CURRENT" != "$LATEST" ]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
-            echo "⚠️  New version available: $LATEST (current: $CURRENT)"
+            echo "New version available: $LATEST (current: $CURRENT)"
           else
             echo "needs_update=false" >> $GITHUB_OUTPUT
-            echo "✓ Already up to date"
+            echo "Already up to date: $CURRENT"
           fi
 
       - name: Get commit hash for new version
         if: steps.compare.outputs.needs_update == 'true'
         id: get_commit
         run: |
-          # Get the commit hash for the new tag
-          COMMIT_HASH=$(curl -s "https://api.github.com/repos/veyon/veyon/git/ref/tags/${{ steps.get_latest.outputs.latest_tag }}" | jq -r '.object.sha')
-          
-          # If it's an annotated tag, get the actual commit it points to
-          if [ $(curl -s "https://api.github.com/repos/veyon/veyon/git/tags/$COMMIT_HASH" | jq -r '.object.type') == "commit" ]; then
-            COMMIT_HASH=$(curl -s "https://api.github.com/repos/veyon/veyon/git/tags/$COMMIT_HASH" | jq -r '.object.sha')
+          TAG="${{ steps.get_latest.outputs.latest_tag }}"
+          REF=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/veyon/veyon/git/ref/tags/$TAG")
+          SHA=$(echo "$REF" | jq -r '.object.sha')
+          TYPE=$(echo "$REF" | jq -r '.object.type')
+          # Dereference annotated tags to get the underlying commit
+          if [ "$TYPE" = "tag" ]; then
+            SHA=$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/veyon/veyon/git/tags/$SHA" \
+              | jq -r '.object.sha')
           fi
-          
-          echo "Commit hash: $COMMIT_HASH"
-          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Commit hash: $SHA"
+          echo "commit_hash=$SHA" >> $GITHUB_OUTPUT
 
-      - name: Create update branch and PR
-        if: steps.compare.outputs.needs_update == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-and-create-pr:
+    needs: check-version
+    if: needs.check-version.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    env:
+      LATEST_VERSION: ${{ needs.check-version.outputs.latest_version }}
+      LATEST_TAG: ${{ needs.check-version.outputs.latest_tag }}
+      CURRENT_VERSION: ${{ needs.check-version.outputs.current_version }}
+      COMMIT_HASH: ${{ needs.check-version.outputs.commit_hash }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Initialize keyring and update system
         run: |
-          LATEST_VERSION="${{ steps.get_latest.outputs.latest_version }}"
-          COMMIT_HASH="${{ steps.get_commit.outputs.commit_hash }}"
-          BRANCH_NAME="update-veyon-$LATEST_VERSION"
-          
-          # Configure git
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm
+
+      - name: Install required tools
+        run: |
+          pacman -S --noconfirm devtools git github-cli namcap
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if update branch already exists
+        id: check_branch
+        run: |
+          BRANCH="update-veyon-${LATEST_VERSION}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "Branch $BRANCH already exists — skipping"
+            echo "branch_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "branch_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update PKGBUILD for new version
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${LATEST_VERSION}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s|^_commit=.*|_commit=${COMMIT_HASH}  # tags/v${LATEST_VERSION}|" PKGBUILD
+          echo "Updated PKGBUILD:"
+          grep -E '^(pkgver|pkgrel|_commit)=' PKGBUILD
+
+      - name: Create build user
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          useradd -m -G wheel builder
+          echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          chown -R builder:builder .
+
+      - name: Create clean chroot
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          mkdir -p /var/lib/archbuild/extra-x86_64
+          mkarchroot /var/lib/archbuild/extra-x86_64/root base-devel
+
+      - name: Build package in clean chroot
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          sudo -u builder makechrootpkg -c -r /var/lib/archbuild/extra-x86_64
+
+      - name: Check package with namcap
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          namcap PKGBUILD
+          namcap *.pkg.tar.zst || true
+
+      - name: Generate updated .SRCINFO
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
+      - name: Upload built package as artifact
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veyon-${{ env.LATEST_VERSION }}
+          path: |
+            *.pkg.tar.zst
+            .SRCINFO
+          retention-days: 30
+
+      - name: Commit, push branch, and open PR
+        if: steps.check_branch.outputs.branch_exists == 'false'
+        run: |
+          BRANCH="update-veyon-${LATEST_VERSION}"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Create new branch
-          git checkout -b "$BRANCH_NAME"
-          
-          # Update PKGBUILD
-          sed -i "s/^pkgver=.*/pkgver=$LATEST_VERSION/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/^_commit=.*/_commit=$COMMIT_HASH  # tags\/v$LATEST_VERSION/" PKGBUILD
-          
-          # Commit changes
-          git add PKGBUILD
-          git commit -m "Update veyon to version $LATEST_VERSION"
-          
-          # Push branch
-          git push -u origin "$BRANCH_NAME"
-          
-          # Create pull request
-          CURRENT_VERSION="${{ steps.get_current.outputs.current_version }}"
-          LATEST_TAG="${{ steps.get_latest.outputs.latest_tag }}"
-          
-          cat > /tmp/pr_body.txt << 'EOF'
-          Automated update to veyon version $LATEST_VERSION
-          
-          ## Changes
-          - Version: $CURRENT_VERSION → $LATEST_VERSION
-          - Commit: $COMMIT_HASH
-          - Release notes: https://github.com/veyon/veyon/releases/tag/$LATEST_TAG
-          
-          ## Checklist
-          - [ ] Review PKGBUILD changes
-          - [ ] Build and test the package
-          - [ ] Verify veyon service status works
-          - [ ] Merge and deploy to AUR
-          
-          This PR was automatically created by the version check workflow.
-          EOF
-          
-          # Substitute variables in the template
-          sed -i "s|\$LATEST_VERSION|$LATEST_VERSION|g" /tmp/pr_body.txt
-          sed -i "s|\$CURRENT_VERSION|$CURRENT_VERSION|g" /tmp/pr_body.txt
-          sed -i "s|\$COMMIT_HASH|$COMMIT_HASH|g" /tmp/pr_body.txt
-          sed -i "s|\$LATEST_TAG|$LATEST_TAG|g" /tmp/pr_body.txt
-          
+
+          # Use GitHub token for authentication
+          gh auth setup-git
+
+          git checkout -b "$BRANCH"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update veyon to ${LATEST_VERSION}"
+          git push -u origin "$BRANCH"
+
           gh pr create \
-            --title "Update veyon to version $LATEST_VERSION" \
-            --body-file /tmp/pr_body.txt \
+            --title "Update veyon to ${LATEST_VERSION}" \
             --base main \
-            --head "$BRANCH_NAME"
+            --head "$BRANCH" \
+            --body "Automated update from \`${CURRENT_VERSION}\` to \`${LATEST_VERSION}\`.
 
-      - name: Create issue if PR creation fails
-        if: steps.compare.outputs.needs_update == 'true' && failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          LATEST_VERSION="${{ steps.get_latest.outputs.latest_version }}"
-          CURRENT_VERSION="${{ steps.get_current.outputs.current_version }}"
-          LATEST_TAG="${{ steps.get_latest.outputs.latest_tag }}"
-          COMMIT_HASH="${{ steps.get_commit.outputs.commit_hash }}"
-          
-          gh issue create \
-            --title "New veyon version available: $LATEST_VERSION" \
-            --body "A new version of veyon is available but automated PR creation failed.
+## Changes
+- Version: \`${CURRENT_VERSION}\` → \`${LATEST_VERSION}\`
+- Commit: \`${COMMIT_HASH}\`
+- Release notes: https://github.com/veyon/veyon/releases/tag/${LATEST_TAG}
 
-**Current version:** $CURRENT_VERSION
-**New version:** $LATEST_VERSION
-**Release notes:** https://github.com/veyon/veyon/releases/tag/$LATEST_TAG
+## Build
+Package was successfully built in a clean Arch Linux chroot before this PR was created.
 
-Please update the PKGBUILD manually:
-\`\`\`
-pkgver=$LATEST_VERSION
-pkgrel=1
-_commit=$COMMIT_HASH  # tags/v$LATEST_VERSION
-\`\`\`" \
-            --label "update"
+## Checklist
+- [ ] Review PKGBUILD changes
+- [ ] Verify package installs and runs correctly
+- [ ] Merge and deploy to AUR
+
+*This PR was automatically created by the update-checker workflow.*"
